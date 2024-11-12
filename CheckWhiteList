@@ -1,0 +1,388 @@
+
+import io.temporal.activity.ActivityOptions;
+import io.temporal.common.RetryOptions;
+import io.temporal.workflow.Workflow;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.util.CollectionUtils;
+
+import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.UUID;
+
+@Slf4j
+public class CheckWhiteListLoanOnlineWorkflowImpl implements CheckWhiteListLoanOnlineWorkflow {
+
+    private ActivityOptions activityOptions = ActivityOptions
+            .newBuilder()
+            .setStartToCloseTimeout(Duration.ofSeconds(60))
+            .setRetryOptions(RetryOptions
+                    .newBuilder()
+                    .setMaximumAttempts(1)
+                    .build())
+            .build();
+
+    private final RegulatoryComplianceActivity activityStub = Workflow.newActivityStub(RegulatoryComplianceActivity.class, activityOptions);
+    final Gson gson = new Gson();
+
+    public ValidatorRequest buildValidateRequest(CicH2HRequest req){
+        return ValidatorRequest.newBuilder()
+                .setFunctionName(AppConstants.FUNCTION_NAME_CHECK_WHITE_LIST_LOAN)
+                .setData(gson.toJson(req).replace("\n",""))
+                .setRequestId(req.getLmid())
+                .build();
+    }
+
+
+
+    @Override
+    public CommonResponse checkWhiteListLoanOnline(RequestDto<WhiteListRequestDTO> request) {
+        String lmid = request.getLmid();
+        var commonResponse = CommonResponse.newBuilder()
+                .setLmid(lmid)
+                .setJsonStringDataReps(request.getData() != null ? gson.toJson(request.getData()) : "")
+                .build();
+
+        log.info("{}: getWhiteListOnline - request: {}", lmid, gson.toJson(request));
+        WhiteListRequestDTO requestData = request.getData();
+        String cifNo = requestData.getCifNo();
+        String productCodeReq = requestData.getProductCode();
+
+        var wfReq = buildRequestForWorkflow(request, lmid, request.getStandId(), request.getStandId());
+
+        ValidatorRequest validatorRequest= buildValidateRequest(wfReq);
+        log.info("{}: toValidatorSvc: {}", lmid, gson.toJson(validatorRequest));
+
+        ValidatorResponse validatorResponse = activityStub.validate(validatorRequest);
+        log.info("{}: frValidatorSvc responseCode={} data={}", lmid, validatorResponse.getResponseCode(), gson.toJson(validatorResponse));
+
+        if (!validatorResponse.getResponseCode().equals(ResponseCode.SUCCESS)){
+            return commonResponse.toBuilder()
+                    .setResponseCode(ResponseStatus.INVALID_INPUT.getCode())
+                    .setDescription("validate fail : "+validatorResponse.getDescription())
+                    .setJsonStringDataReps("")
+                    .build();
+        }
+
+        /*stat
+        * 1 CifNo has maximum 2 WLs.
+        * Row1: Maximum CreditLimit,
+        *       IF <> PAYROLL  : then Row2 == PAYROLL as WL2nd -> end
+        *       ELSE == PAYROLL: -> end
+        * */
+
+
+        List<WLLoanOnline> dwhWLLoanOnlineList = activityStub.getWLLoanOnlineByCifNo(cifNo);
+        log.info("{}: getWhiteListOnline - DWH_WL_LoanOnlineEntity: {}", lmid, gson.toJson(dwhWLLoanOnlineList));
+        //step 1
+        if (CollectionUtils.isEmpty(dwhWLLoanOnlineList)) {
+            return buildWhiteListResponseFailure(requestData, ResponseStatus.NO_RECORD.getCode(), ResponseStatus.NO_RECORD.getDetail(), lmid);
+        }
+
+        // step 2
+        // get Row1 that = MAX_CREDIT_LIMIT, then sort that list by CusGroup<>PAYROLL is higher priority, CusGroup==PAYROLL is lower priority,
+        List<WLLoanOnline> listWLSortedByCreditLimit = dwhWLLoanOnlineList.stream()
+                .sorted(DataBaseUtils.sortByCreditLimitAndCustGroup())
+                .toList();
+
+
+        int rowCount = 0;
+        for (WLLoanOnline dwWLLoanOnline : listWLSortedByCreditLimit) {
+            // Get Loan Master Product
+            String cusType = dwWLLoanOnline.getCustomerType();
+
+            String cusCondition = dwWLLoanOnline.getCustomerCondition();
+
+            String cusGroup = dwWLLoanOnline.getCustomerGroup();
+            boolean isCusGroupPayroll = "PAYROLL".equalsIgnoreCase(cusGroup);
+
+            if (cusCondition.equalsIgnoreCase("MLOAN_LMIT")) {
+                cusCondition = "MLOAN_LIMIT";
+            }
+            rowCount++;
+            if (rowCount >= 2 && !isCusGroupPayroll) continue; // Row2 must be a Payroll
+            log.info("{}: getWhiteListOnline - check WL condition with DwhWLLoanOnline {}", lmid, dwWLLoanOnline);
+
+            WLLoanMasterDim loanMasterDim = activityStub.getLoanMasterProduct(cusType, cusCondition, productCodeReq);
+            if (loanMasterDim == null) {
+                log.info("{}: getWhiteListOnline - LoanMasterDim = null with WLLoanOnlineEntity = {}", lmid, dwWLLoanOnline);
+                if (isCusGroupPayroll) break; // if MaxCreditLimit is Payroll -> END
+                continue; // else check the second row = Payroll
+            }
+            log.info("{}: getWhiteListOnline - LoanMasterDim: {}", lmid, gson.toJson(loanMasterDim));
+            BigDecimal avgAmountDWH = dwWLLoanOnline.getAvgAmount();
+            BigDecimal avgDebtDWH = dwWLLoanOnline.getAvgDebitAmount();
+            BigDecimal avgAmountRealTime;
+            BigDecimal creditLimitRealTime;
+
+
+            if (dwWLLoanOnline.getCustomerCondition().equalsIgnoreCase("PAYR_DR")) {
+                creditLimitRealTime = switch (dwWLLoanOnline.getAmountCalcType()) {
+                    case "AMT" -> loanMasterDim.getMaxAmount();
+                    case "PERC" -> dwWLLoanOnline.getAmountCalcValue().multiply(avgAmountDWH);
+                    default -> BigDecimal.ZERO;
+                };
+                log.info("{}: getWhiteListOnline - calculate creditLimitRealTime : {}", lmid, creditLimitRealTime);
+
+                // calculate CreditLimit
+
+                if (creditLimitRealTime.compareTo(BigDecimal.ZERO) < 0) continue;
+
+                return buildWhiteListResponseSuccess(requestData, dwWLLoanOnline, creditLimitRealTime, BigDecimal.valueOf(0), lmid);
+            }
+
+            if (dwWLLoanOnline.getCustomerCondition().equalsIgnoreCase("PAYR_CR")) {
+                creditLimitRealTime = switch (dwWLLoanOnline.getAmountCalcType()) {
+                    case "AMT" -> loanMasterDim.getMaxAmount();
+                    case "PERC" -> dwWLLoanOnline.getAmountCalcValue().multiply(avgAmountDWH);
+                    default -> BigDecimal.ZERO;
+                };
+                log.info("{}: getWhiteListOnline - calculate creditLimitRealTime : {}", lmid, creditLimitRealTime);
+
+                // calculate CreditLimit
+
+                if (creditLimitRealTime.compareTo(BigDecimal.ZERO) < 0 ) continue;
+
+                return buildWhiteListResponseSuccess(requestData, dwWLLoanOnline, creditLimitRealTime, BigDecimal.valueOf(0), lmid);
+            }
+
+            if(dwWLLoanOnline.getCustomerCondition().equalsIgnoreCase("STAFF")){
+
+                creditLimitRealTime = switch (dwWLLoanOnline.getAmountCalcType()){
+                    case "AMT"  -> loanMasterDim.getMaxAmount();
+                    case "PERC" -> dwWLLoanOnline.getAmountCalcValue().multiply(avgAmountDWH);
+                    default     ->  BigDecimal.ZERO;
+                };
+
+                log.info("{}: getWhiteListOnline - calculate creditLimitRealTime : {}", lmid, creditLimitRealTime);
+
+                if (creditLimitRealTime.compareTo(BigDecimal.ZERO) < 0) continue;
+
+                return buildWhiteListResponseSuccess(requestData, dwWLLoanOnline, creditLimitRealTime, BigDecimal.valueOf(0), lmid );
+            }
+
+            if (dwWLLoanOnline.getCustomerCondition().equalsIgnoreCase("CASA_AVG")) {
+                creditLimitRealTime = switch (dwWLLoanOnline.getAmountCalcType()) {
+                    case "AMT" -> loanMasterDim.getMaxAmount();
+                    case "PERC" -> loanMasterDim.getAmountCalcValue().multiply(avgAmountDWH);
+                    default -> BigDecimal.ZERO;
+                };
+                log.info("{}: getWhiteListOnline - calculate creditLimitRealTime : {}", lmid, creditLimitRealTime);
+
+                // calculate CreditLimit
+
+                if (creditLimitRealTime.compareTo(BigDecimal.ZERO) < 0 ) continue;
+
+                return buildWhiteListResponseSuccess(requestData, dwWLLoanOnline, creditLimitRealTime, dwWLLoanOnline.getMinAvgAmount(), lmid);
+            }
+
+            if (loanMasterDim.getCustomerCondition().equalsIgnoreCase("DEP_AVG")) {
+                // calculate AvgAmount
+                avgAmountRealTime = calculateAvgAmountRealtimeDepAvg(request, avgAmountDWH, lmid);
+                log.info("{}: getWhiteListOnline - calculate AvgAmountRealtimeDepAvg: {}", lmid, avgAmountRealTime.toPlainString());
+
+                // calculate CreditLimit
+                creditLimitRealTime = this.getCreditLimitRealTimeAndSolvencyRate(request, loanMasterDim, avgAmountRealTime, cusGroup, avgDebtDWH, lmid);
+                if (creditLimitRealTime.compareTo(BigDecimal.ZERO) < 0) continue;
+
+                return buildWhiteListResponseSuccess(requestData, dwWLLoanOnline, creditLimitRealTime, avgAmountRealTime, lmid);
+
+            } else if (loanMasterDim.getCustomerCondition().equalsIgnoreCase("CARD_LIMIT")) {
+                //get LegalId
+
+                // TODO hard code
+                CustomerWL legalID =  new CustomerWL();
+                legalID.setCB_CUSTOMER_IDNO(dwWLLoanOnline.getCustomerCode());
+
+//                CustomerWL legalID = activityStub.getLegalFromCifNo(cifNo);
+
+
+
+                if (legalID == null || StringUtils.isBlank(legalID.getCB_CUSTOMER_IDNO())) {
+                    log.error("{}: Inquiry Customer CifNo = {}, find LegalId = {}", lmid, cifNo, legalID);
+                    log.info("{}: getWhiteListOnline - Not meet WL condition with CusType={}", lmid, "CARD_LIMIT");
+                    return buildWhiteListResponseFailure(requestData, ResponseStatus.INVALID_NUMBER.getCode(), "LegalId not found with Cif = " + cifNo, lmid);
+                }
+                // calculate AvgAmount
+                avgAmountRealTime = calculateAvgAmountRealtimeCardLimit(legalID, request.getData().getCifNo(), request.getRequestId(),
+                        lmid, dwWLLoanOnline.getMaxAmount());
+                log.info("{}: getWhiteListOnline - calculateAvgAmountRealtimeCardLimit: {}", lmid, avgAmountRealTime.toPlainString());
+
+                // calculate CreditLimit
+                creditLimitRealTime = this.getCreditLimitRealTimeAndSolvencyRate(request, loanMasterDim, avgAmountRealTime, cusGroup, avgDebtDWH, lmid);
+                if (creditLimitRealTime.compareTo(BigDecimal.ZERO) < 0) continue;
+
+                return buildWhiteListResponseSuccess(requestData, dwWLLoanOnline, creditLimitRealTime, avgAmountRealTime, lmid);
+
+            } else {
+                // cusCondition remaining
+                log.info("{}: getWhiteListOnline, MasterProductCustomerCondition(): {} invalid", lmid, loanMasterDim.getCustomerCondition());
+                return buildWhiteListResponseFailure(requestData, ResponseStatus.SYSTEM_MALFUNCTION_115.getCode()
+                        , String.format("CIF = %s with cusCondition = %s has not been supported on MCSWhiteList", cifNo, loanMasterDim.getCustomerCondition()), lmid);
+            }
+        }
+
+        // Not found any Row that satisfies WL
+        return buildWhiteListResponseFailure(requestData, ResponseStatus.NO_RECORD.getCode()
+                , "No record meet with WhileList condition", lmid);
+    }
+
+    private BigDecimal getCreditLimitRealTimeAndSolvencyRate(RequestDto<WhiteListRequestDTO> request, WLLoanMasterDim loanMasterDim
+            , BigDecimal avgAmountRealTime, String cusGroup, BigDecimal avgDebtDwh, String lmid) {
+        boolean isCusGroupPayroll = "PAYROLL".equalsIgnoreCase(cusGroup);
+        // CALCULATE CREDIT_LIMIT
+        BigDecimal creditLimitRealTime = switch (loanMasterDim.getAmountCalcType()) {
+            case "AMT" -> loanMasterDim.getAmountCalcValue();
+            case "PERC" -> loanMasterDim.getAmountCalcValue().multiply(avgAmountRealTime);
+            default -> BigDecimal.ZERO;
+        };
+        log.info("{}: getWhiteListOnline - calculate CreditLimitRealtimeDepAvg: {}", lmid, creditLimitRealTime.toPlainString());
+
+        if (creditLimitRealTime.compareTo(loanMasterDim.getMinAmount()) < 0) {
+            log.info("{}: getWhiteListOnline - Not meet WL condition: CreditLimitRealTime ({}) less than ProductMinAmount ({})"
+                    , lmid, creditLimitRealTime.toPlainString(), loanMasterDim.getMinAmount().toPlainString());
+            if (isCusGroupPayroll) throw new WhiteListException(ResponseStatus.NO_RECORD.getCode(), "No record meet with WhileList condition");
+            return BigDecimal.valueOf(-1);
+        }
+        BigDecimal oldCreditLimit = creditLimitRealTime;
+        creditLimitRealTime = creditLimitRealTime.min(loanMasterDim.getMaxAmount());
+        log.info("{}: getWhiteListOnline - DEP_AVG - Min(CreditLimit={}, ProductMaxAmount={}): {}"
+                , lmid, oldCreditLimit.toPlainString(), loanMasterDim.getMaxAmount().toPlainString(), creditLimitRealTime.toPlainString());
+
+        // CALCULATE SOLVENCY_RATE
+        double productMinSolvencyRate = loanMasterDim.getMinSolvencyRate() == null ? 0 : loanMasterDim.getMinSolvencyRate().doubleValue();
+        log.info("{}: getWhiteListOnline - productMinSolvencyRate: {}", lmid, new BigDecimal(productMinSolvencyRate).toPlainString());
+        if (productMinSolvencyRate > 0) { // Product has a condition on SolvencyRate
+            // Check whether CustomerSolvencyRate meets ProductMinSolvencyRate condition or not
+            double solvencyRate = calculateSolvencyRate(request, request.getData().getCifNo(), cusGroup, avgAmountRealTime, avgDebtDwh);
+            log.info("{}: getWhiteListOnline - SolvencyRateRealTime: {}", lmid, new BigDecimal(solvencyRate).toPlainString());
+            if (solvencyRate >= productMinSolvencyRate) {
+                log.info("{}: getWhiteListOnline - Not meet WL condition: SolvencyRateRealTime = {} is greater ProductMinSolvencyRate = {}"
+                        , lmid, new BigDecimal(solvencyRate).toPlainString(), new BigDecimal(productMinSolvencyRate).toPlainString());
+                if (isCusGroupPayroll) throw new WhiteListException(ResponseStatus.NO_RECORD.getCode(), "No record meet with WhileList condition");
+                return BigDecimal.valueOf(-1);
+            }
+        }
+
+        return creditLimitRealTime;
+    }
+
+    private BigDecimal calculateAvgAmountRealtimeDepAvg(RequestDto<WhiteListRequestDTO> dto, BigDecimal avgAmountDWH, String lmid) {
+        // Request to T24
+        var grpcGetDepositWL = (GetDepositWhiteListRequest)CommonUtils.buildGrpcRequest(GetDepositWhiteListRequest.newBuilder(), dto
+                , gson.toJson(dto.getData()), String.valueOf(FlowType.GET_DEPOSIT_WHITE_LIST)).build();
+        CommonResponse grpcGetDepositResponse = activityStub.getDepositWhiteListT24(grpcGetDepositWL);
+        // Response to T24
+        var grpcGetDepositWLRes = gson.fromJson(grpcGetDepositResponse.getJsonStringDataReps(), DepositWhiteListResponse.class);
+
+        BigDecimal totalRealtimeAmountT24 = activityStub.calAvgAmountDepositAvgT24(grpcGetDepositWLRes);
+        log.info("{}: getWhiteListOnline - DEP_AVG-total Deposit amount T24: {}", lmid, totalRealtimeAmountT24.toPlainString());
+        var avgAmount = totalRealtimeAmountT24.min(avgAmountDWH);
+        log.info("{}: getWhiteListOnline - DEP_AVG-avgAmount Min of T24({}) - DWH({}) = {}"
+                , lmid, totalRealtimeAmountT24.toPlainString(), avgAmountDWH.toPlainString(), avgAmount.toPlainString());
+
+        return avgAmount;
+    }
+
+    private BigDecimal calculateAvgAmountRealtimeCardLimit(CustomerWL customerWL, String cifNo, String requestId, String lmid, String wlLoanOnline) {
+        CustomerWL getAgeLate = activityStub.getAgeLate(customerWL.getCB_CUSTOMER_IDNO());
+        log.info("{}: getWhiteListOnline - CARD_LIMIT - AgeLate={}", lmid, gson.toJson(getAgeLate));
+        if (Integer.parseInt(getAgeLate.getAGE_LATE().trim()) > 0) {
+            return new BigDecimal(0);
+        }
+
+        CustomerWL getAge6Month = activityStub.getAge6Month(customerWL.getCB_CUSTOMER_IDNO());
+        log.info("{}: getWhiteListOnline - CARD_LIMIT - Age06M={}", lmid, gson.toJson(getAge6Month));
+        if (StringUtils.isNotBlank(getAge6Month.getAGE_06M()) && Integer.parseInt(getAge6Month.getAGE_06M().trim()) > 2) {
+            return new BigDecimal(0);
+        }
+//        get omniCard
+
+//        // TODO hard code
+        // double cashLimit = activityStub.getCashBalanceCard(customerWL.getCB_CUSTOMER_IDNO(), cifNo, requestId, lmid);
+        double cashLimit = Double.parseDouble(wlLoanOnline);
+
+//        double cashLimit = 80000000;
+        log.info("{}: getWhiteListOnline - CARD_LIMIT - getCashBalanceCard - cashLimit={}", lmid, new BigDecimal(cashLimit).toPlainString());
+        return BigDecimal.valueOf(cashLimit);
+    }
+
+    private <T> double calculateSolvencyRate(RequestDto<T> dto, String cifNo, String cusGroupDWH, BigDecimal avgAmount, BigDecimal avgDebtDWH) {
+        if (!cusGroupDWH.equalsIgnoreCase("PAYROLL") || avgAmount == null || avgAmount.doubleValue() <= 0) {
+            return -1;
+        }
+        //getAccountIDLinkage T24
+        String requestDateTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
+        String stanId = UUID.randomUUID().toString();
+        // Request to T24
+        AccountIDLinkageRequest dtoAcctLinkage = new AccountIDLinkageRequest(cifNo, stanId, requestDateTime);
+        var grpcAccountIdLinkageRequest = (GetListAccountIdLinkageRequest)CommonUtils.buildGrpcRequest(GetListAccountIdLinkageRequest.newBuilder(), dto
+                , gson.toJson(dtoAcctLinkage), String.valueOf(FlowType.GET_LIST_ACCOUNT_ID_LINKAGE)).build();
+        // Response from T24
+        CommonResponse grpcAccountIDLinkageResponse = activityStub.getListAccountIdLinkage(grpcAccountIdLinkageRequest);
+        var getAccountIDLinkageRes = gson.fromJson(grpcAccountIDLinkageResponse.getJsonStringDataReps(), AccountIDLinkageResponse.class);
+
+        if (getAccountIDLinkageRes == null)
+            throw new WhiteListException(grpcAccountIDLinkageResponse.getResponseCode(), grpcAccountIDLinkageResponse.getDescription());
+
+        //% tính tỉ lệ thanh toán = nợ phải trả hàng tháng / tổng thu nhập hàng tháng
+        return (double) Math.round((avgDebtDWH.doubleValue() + getAccountIDLinkageRes.getTotalInstAmt()) / avgAmount.doubleValue()) / 100;
+    }
+    private CommonResponse buildWhiteListResponseSuccess(WhiteListRequestDTO dataRequestDto, WLLoanOnline customerCondition
+            , BigDecimal creditLimit, BigDecimal avgAmount, String lmid) {
+        var whiteListResponseDTO = new WhiteListResponseDTO(
+                dataRequestDto.getCifNo(),
+                dataRequestDto.getProductCode(),
+                "Y",
+                String.format("%.0f", creditLimit),
+                customerCondition.getCustomerType(),
+                customerCondition.getCustomerGroup(),
+                customerCondition.getCustomerCondition(),
+                customerCondition.getBranchCode(),
+                customerCondition.getPayDate() == null ? null : customerCondition.getPayDate().toLocalDateTime().toLocalDate().toString(),
+                customerCondition.getPayAccount(),
+                String.format("%.0f", avgAmount),
+                String.format("%.0f", customerCondition.getAvgDebitAmount()));
+
+        log.info("{}: getWhiteListOnline - response: {}", lmid, gson.toJson(whiteListResponseDTO));
+        return CommonResponse.newBuilder()
+                .setResponseCode(ResponseStatus.SUCCESS.getCode())
+                .setDescription(ResponseStatus.SUCCESS.getDetail())
+                .setJsonStringDataReps(gson.toJson(whiteListResponseDTO))
+                .build();
+    }
+
+    private CommonResponse buildWhiteListResponseFailure(WhiteListRequestDTO dataRequestDto, String resCode, String message, String lmid) {
+        var whiteListResponseDTO = CommonUtils.buildWhiteListResponseFailure(dataRequestDto.getCifNo(), dataRequestDto.getProductCode());
+        log.info("{}: getWhiteListOnline, response: {}", lmid, gson.toJson(whiteListResponseDTO));
+        return CommonResponse.newBuilder()
+                .setResponseCode(resCode)
+                .setDescription(message)
+                .setJsonStringDataReps(gson.toJson(whiteListResponseDTO))
+                .build();
+    }
+
+    public ValidatorRequest buildValidateRequest(CheckWhiteListLoanRequest req){
+        return ValidatorRequest.newBuilder()
+                .setFunctionName(AppConstants.FUNCTION_NAME_CHECK_WHITE_LIST_LOAN_ONLINE)
+                .setData(gson.toJson(req).replace("\n",""))
+                .setRequestId(req.getLmid())
+                .build();
+    }
+
+    public CheckWhiteListLoanRequest buildRequestForWorkflow(RequestDto<WhiteListRequestDTO> req, String lmid, String stanId, String clientId) {
+        return CheckWhiteListLoanRequest.newBuilder()
+                .setLmid(lmid)
+                .setStanId(stanId)
+                .setRequestId(req.getRequestId())
+                .setRequestDateTime(req.getRequestDateTime())
+                .setJsonData(gson.toJson(req.getData()))
+                .setFunctionName(String.valueOf(FlowType.CHECK_WHITE_LIST_LOAN_ONLINE))
+                .setClientId(clientId)
+                .setChannel(req.getChannel())
+                .build();
+    }
+}
